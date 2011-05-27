@@ -1,0 +1,128 @@
+module Delayed
+  module Backend
+    module Riak
+      # A job object that is persisted to the database.
+      # Contains the work object as a YAML field.
+      class Job 
+        include Ripple::Document
+        include Delayed::Backend::Base
+        
+        property :priority,    Integer, :default => 0
+        property :attempts,    Integer, :default => 0
+        property :handler,     Text
+        property :run_at,      Time
+        property :locked_at,   Time
+        property :locked_by,   String
+        property :failed_at,   Time
+        property :last_error,  Text
+                
+                
+        before_save :set_default_run_at
+        
+        
+        # these functions should be stored in the db at some point in time
+        # but as this is just the begining of this I'll leave them here until they
+        # have been tested and proven to work
+        FUNCTION  = %{function(value,keydata,arg){
+
+          var inRange = function(val, min,max){
+             if(val == null && min != null ) return false;
+             if(vall == null && min == null) return true;
+             if(val=>min &&  val <= max) return true;
+             return false;
+          }  
+
+          if( data.run_at <= arg.run_at &&
+           (data.locked_by == null || data.locked_at == arg.worker_name ) &&
+          inRange(data.priority, arg.min_priority,arg.max_priority) &&
+          data.failed_at == null && 
+          (data.locked_at == null || data.locked_at <= arg.locked_at){
+             return [value];
+          }
+          return [];
+        }
+        }
+
+        SORT = %{function(a,b){ var da = Riak.mapValuesJson(a); 
+                               var db = Riak.mapValuesJson(b);
+                               return db.priority  - da.priority ;
+                               } 
+                }
+                               
+         # Find a few candidate jobs to run (in case some immediately get locked by others).
+         def self.find_available(worker_name, limit = 5, max_run_time = Worker.max_run_time)
+           args = {}
+           args["locked_by"] = worker_name
+           args["locaked_at"] = db_time_now - max_run_time
+           args["min_priority"] = Worker.min_priority if Worker.min_priority
+           args["max_priority"] = Worker.max_priority if Worker.max_priority
+           args["run_at"] = db_time_now 
+           
+           mr = Riak::MapReduce.new(@robject.client)
+           mr.map(FUNCTION,args)
+           mr.reduce(SORT)
+           mr.reduce("Riak.reduceLimit", {:arg=>limit, :keep=>true})
+           
+           possibles = mp.run.map{|ro| instantiate(ro)}
+           return possibles
+         end
+         
+         def lock_exclusively!(max_run_time, worker)
+             self.robject.prevent_stale_writes=true
+             self.locked_by = worker
+             self.locked_at = db_time_now
+             
+             # the prevent_stale_writes setting above may cause an error
+             # to be thrown,  it doesn't gaurantee that it will prevent 
+             # a conflict though so we must check to see if there is one
+             # If there is a conflict we wont try to resolve it, it means
+             #another worker actually got the job and is running it. If the
+             # job succeeds it will be removed so there's no problem with this
+             # if it fails and needs to be rescheduled the worker running the job
+             # will resolve any conflicts and put it back in the queue
+             begin
+               self.save
+               return self.conflict? ? false : true
+             rescue
+             
+             end
+             return false
+         end
+         
+         
+         def self.instantiate(robject)
+            klass = robject.data['_type'].constantize rescue self
+            klass.new.tap do |doc|
+              doc.key = robject.key
+              doc.__send__(:raw_attributes=, robject.data.except("_type")) if robject.data
+              doc.instance_variable_set(:@new, false)
+              doc.instance_variable_set(:@robject, robject)
+            end
+          end
+                
+          def self.db_time_now
+            Time.now
+         end
+         
+         # on a failed attempt the job may be rescheduled but  the robject maybe is a slightly 
+         # conflicted state if another worker had tried to lock the job.  To deal with this we will
+         # save the attributes that the object currently has and then do a reload from the db. If we 
+         # see that there is a conflict we will simply reset the attributes with the ones that we originally had
+         # and then save the object back to the db.  This will set the vector clock correctly and the object
+         # can then be rescheduled .
+         
+         def failed
+            atts = self.attributes
+            self.reload
+            if self.robject.conflict?
+               self.attributes = atts
+               self.save
+            end
+         end
+         
+         
+      end
+    end
+  end
+end
+      
